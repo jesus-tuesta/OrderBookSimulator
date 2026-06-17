@@ -1,4 +1,4 @@
-add_executable(app app.cc orderBookTrack.hpp networking.hpp configBars.h barAsParquet.hpp commons.hpp)
+add_executable(app app.cc orderBookTrack.hpp networking.hpp configBars.h barAsParquet.hpp commons.hpp channel.hpp)
 target_link_libraries(app PRIVATE Boost::beast OpenSSL::SSL nlohmann_json::nlohmann_json
                                         OpenSSL::Crypto)
 

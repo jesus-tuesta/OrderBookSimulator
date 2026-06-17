@@ -1,9 +1,13 @@
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/awaitable.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ssl/error.hpp>
 #include <boost/asio/ssl/stream.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
+#include <coroutine>
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
@@ -26,16 +30,17 @@ public:
   WebsocketClient(
     std::string_view host,
     std::string_view port,
-    std::string_view target);
-  void        connect();
-  void        send(const json& j);
-  std::string readMessage();
-  void        close();
+    std::string_view target,
+    net::io_context& ioc);
+  void                        connect();
+  void                        send(const json& j);
+  std::string                 readMessage();
+  net::awaitable<std::string> async_readMessage();
+  void                        close();
 
 private:
   void load_root_certificates(ssl::context& ctx);
 
-  net::io_context                                   ioc;
   ssl::context                                      ctx;
   tcp::resolver                                     resolver;
   websocket::stream<beast::ssl_stream<tcp::socket>> ws;
@@ -47,7 +52,8 @@ private:
 WebsocketClient::WebsocketClient(
   std::string_view host_,
   std::string_view port_,
-  std::string_view target_)
+  std::string_view target_,
+  net::io_context& ioc)
   : host(host_)
   , port(port_)
   , target(target_)
@@ -95,6 +101,13 @@ std::string WebsocketClient::readMessage()
   buffer.consume(buffer.size());
   ws.read(buffer);
   return beast::buffers_to_string(buffer.data());
+}
+
+net::awaitable<std::string> WebsocketClient::async_readMessage()
+{
+  buffer.consume(buffer.size());
+  co_await ws.async_read(buffer, net::use_awaitable);
+  co_return beast::buffers_to_string(buffer.data());
 }
 
 void WebsocketClient::close()

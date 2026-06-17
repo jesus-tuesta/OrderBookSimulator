@@ -1,4 +1,5 @@
 #include "barAsParquet.hpp"
+#include "channel.hpp"
 #include "commons.hpp"
 #include "configBars.h"
 #include "networking.hpp"
@@ -6,6 +7,13 @@
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
+#include <boost/asio.hpp>
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -15,9 +23,11 @@
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
 #include <string>
+#include <tuple>
 
 using namespace std::chrono;
-using json = nlohmann::json;
+namespace asio = boost::asio;
+using json     = nlohmann::json;
 
 void alpaca_connect(WebsocketClient& client, std::ostream& log_file)
 {
@@ -86,7 +96,7 @@ void process_message(
   }
 }
 
-int main()
+std::tuple<std::ofstream, std::ofstream, std::ofstream> defining_logs()
 {
   std::ofstream log_file("src/barGeneration/log.txt", std::ios::out);
   if (!log_file.is_open())
@@ -100,24 +110,68 @@ int main()
     "src/barGeneration/alpaca_data.jsonl", std::ios::out);
   if (!alpaca_data_out.is_open())
     throw std::runtime_error("Failed to open output file");
-  std::vector<bar> bars;
+  return std::make_tuple(
+    std::move(log_file), std::move(bars_file), std::move(alpaca_data_out));
+}
 
+asio::awaitable<void> reader(WebsocketClient& client, channel<std::string>& ch)
+{
+  for (;;) {
+    std::string msg = co_await client.async_readMessage();
+    co_await ch.send(std::move(msg));
+  }
+}
+
+asio::awaitable<void> processor(
+  channel<std::string>& ch,
+  std::ostream&         alpaca_data_out,
+  orderBook&            ob,
+  std::vector<bar>&     bars,
+  std::ostream&         log_file,
+  std::ostream&         bars_file)
+{
+  for (;;) {
+    std::string msg = co_await ch.receive();
+    process_message(msg, alpaca_data_out, ob, bars, log_file, bars_file);
+  }
+}
+
+asio::awaitable<void> stop_after(
+  std::chrono::seconds runtime,
+  asio::io_context&    io)
+{
+  asio::steady_timer timer(co_await asio::this_coro::executor);
+  timer.expires_after(runtime);
+  co_await timer.async_wait(asio::use_awaitable);
+  io.stop();
+}
+
+int main()
+{
+  auto logs                                    = defining_logs();
+  auto& [log_file, bars_file, alpaca_data_out] = logs;
+  net::io_context ioc;
+
+  std::vector<bar> bars;
   try {
-    WebsocketClient client(config::HOST, config::PORT, config::TARGET);
+    WebsocketClient client(config::HOST, config::PORT, config::TARGET, ioc);
     alpaca_connect(client, log_file);
 
     auto       start   = std::chrono::steady_clock::now();
-    const auto runtime = std::chrono::seconds(60);
+    const auto runtime = std::chrono::seconds(5);
 
     orderBook ob;
     ob.firstBarCameIn();
 
-    // Read messages for the runtime
-    while (std::chrono::steady_clock::now() - start < runtime) {
-      // message from the buffer
-      std::string msg = client.readMessage();
-      process_message(msg, alpaca_data_out, ob, bars, log_file, bars_file);
-    }
+    channel<std::string> ch(ioc.get_executor(), 100'000);
+    asio::co_spawn(ioc, reader(client, ch), asio::detached);
+    asio::co_spawn(
+      ioc,
+      processor(ch, alpaca_data_out, ob, bars, log_file, bars_file),
+      asio::detached);
+    asio::co_spawn(ioc, stop_after(runtime, ioc), asio::detached);
+    ioc.run();
+
     saveBarsToParquet(bars);
     // Close WebSocket
     client.close();
