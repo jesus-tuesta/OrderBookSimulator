@@ -1,9 +1,4 @@
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/awaitable.hpp>
 #include <boost/asio/connect.hpp>
-#include <boost/asio/ssl/error.hpp>
-#include <boost/asio/ssl/stream.hpp>
-#include <boost/asio/use_awaitable.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
@@ -32,11 +27,11 @@ public:
     std::string_view port,
     std::string_view target,
     net::io_context& ioc);
-  void                        connect();
-  void                        send(const json& j);
-  std::string                 readMessage();
-  net::awaitable<std::string> async_readMessage();
-  void                        close();
+  void        connect();
+  void        send(const json& j);
+  std::string readMessage();
+  void        close();
+  void        shutdown();
 
 private:
   void load_root_certificates(ssl::context& ctx);
@@ -103,15 +98,14 @@ std::string WebsocketClient::readMessage()
   return beast::buffers_to_string(buffer.data());
 }
 
-net::awaitable<std::string> WebsocketClient::async_readMessage()
-{
-  buffer.consume(buffer.size());
-  co_await ws.async_read(buffer, net::use_awaitable);
-  co_return beast::buffers_to_string(buffer.data());
-}
-
 void WebsocketClient::close()
 {
   beast::error_code ec;
   ws.close(websocket::close_code::normal, ec);
+}
+
+void WebsocketClient::shutdown()
+{
+  beast::error_code ec;
+  beast::get_lowest_layer(ws).close(ec);
 }

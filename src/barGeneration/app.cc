@@ -7,13 +7,7 @@
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
-#include <boost/asio.hpp>
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/asio/this_coro.hpp>
-#include <boost/asio/use_awaitable.hpp>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -23,6 +17,7 @@
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
 #include <string>
+#include <thread>
 #include <tuple>
 
 using namespace std::chrono;
@@ -114,37 +109,21 @@ std::tuple<std::ofstream, std::ofstream, std::ofstream> defining_logs()
     std::move(log_file), std::move(bars_file), std::move(alpaca_data_out));
 }
 
-asio::awaitable<void> reader(WebsocketClient& client, channel<std::string>& ch)
+void write_csv_metrics(std::vector<thread_info> metric)
 {
-  for (;;) {
-    std::string msg = co_await client.async_readMessage();
-    co_await ch.send(std::move(msg));
+  std::ofstream csv("metrics.csv");
+  csv << "ts_ns,consumer,producer,queue_size\n";
+  for (auto const& line : metric) {
+    csv << line.ts.time_since_epoch().count() << "," << line.consumer_run << ","
+        << line.producer_run << "," << line.queue_size << "\n";
   }
 }
 
-asio::awaitable<void> processor(
-  channel<std::string>& ch,
-  std::ostream&         alpaca_data_out,
-  orderBook&            ob,
-  std::vector<bar>&     bars,
-  std::ostream&         log_file,
-  std::ostream&         bars_file)
-{
-  for (;;) {
-    std::string msg = co_await ch.receive();
-    process_message(msg, alpaca_data_out, ob, bars, log_file, bars_file);
-  }
-}
-
-asio::awaitable<void> stop_after(
-  std::chrono::seconds runtime,
-  asio::io_context&    io)
-{
-  asio::steady_timer timer(co_await asio::this_coro::executor);
-  timer.expires_after(runtime);
-  co_await timer.async_wait(asio::use_awaitable);
-  io.stop();
-}
+template<typename T>
+using channel_type = std::conditional_t<
+  config::thread_config == multithread_type::lock_free,
+  channel_lock_free<T>,
+  channel_lock_based<T>>;
 
 int main()
 {
@@ -152,29 +131,53 @@ int main()
   auto& [log_file, bars_file, alpaca_data_out] = logs;
   net::io_context ioc;
 
-  std::vector<bar> bars;
+  std::vector<thread_info> metrics;
+  auto                     last_dump = std::chrono::steady_clock::time_point{};
+  std::vector<bar>         bars;
   try {
     WebsocketClient client(config::HOST, config::PORT, config::TARGET, ioc);
     alpaca_connect(client, log_file);
 
-    auto       start   = std::chrono::steady_clock::now();
-    const auto runtime = std::chrono::seconds(5);
+    const auto runtime = std::chrono::seconds(60);
 
     orderBook ob;
     ob.firstBarCameIn();
 
-    channel<std::string> ch(ioc.get_executor(), 100'000);
-    asio::co_spawn(ioc, reader(client, ch), asio::detached);
-    asio::co_spawn(
-      ioc,
-      processor(ch, alpaca_data_out, ob, bars, log_file, bars_file),
-      asio::detached);
-    asio::co_spawn(ioc, stop_after(runtime, ioc), asio::detached);
-    ioc.run();
+    channel_type<std::string> ch(100'000);
+    std::thread               producer([&] {
+      try {
+        while (true) {
+          std::string msg = client.readMessage();
+          ch.send(std::move(msg));
+        }
+      }
+      catch (std::exception const& e) {
+        std::cerr << "Producer error: " << e.what() << std::endl;
+      }
+    });
 
-    saveBarsToParquet(bars);
-    // Close WebSocket
+    std::thread consumer([&] {
+      std::string msg;
+      while (ch.receive(msg)) {
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_dump > 200ms) {
+          metrics.push_back(ch.current_status());
+          last_dump = now;
+        }
+        process_message(msg, alpaca_data_out, ob, bars, log_file, bars_file);
+      }
+    });
+
+    std::this_thread::sleep_for(runtime);
+    ch.close();
+    client.shutdown();
+
+    producer.join();
+    consumer.join();
+
+    write_csv_metrics(metrics);
     client.close();
+    saveBarsToParquet(bars);
     std::cout << "Data collection complete, saved to alpaca_data.jsonl\n";
     log_file << "Data collection complete, saved to alpaca_data.jsonl\n";
     ob.showBook(log_file);
